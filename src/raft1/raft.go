@@ -7,7 +7,6 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
-	//	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -19,6 +18,15 @@ import (
 	"6.5840/tester1"
 )
 
+const (
+	Follower  = "Follower"
+	Candidate = "Candidate"
+	Leader    = "Leader"
+)
+
+var (
+	electionTimeout = 500
+)
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -32,16 +40,20 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	state     string
+	eventChan chan struct{}
+	timestamp int64
+
+	// Persistent state on all servers
+	currentTerm int
+	votedFor    int
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (3A).
-	return term, isleader
+	return rf.currentTerm, rf.state == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -61,7 +73,6 @@ func (rf *Raft) persist() {
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
 }
-
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
@@ -90,7 +101,6 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -100,22 +110,64 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term        int
+	CandidateId int
+	Timestamp   int64
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	Term        int
+	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = args.CandidateId
+		rf.state = Follower
+		reply.Term = args.Term
+		reply.VoteGranted = true
+		rf.eventChan <- struct{}{}
+		return
+	}
+
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		rf.votedFor = args.CandidateId
+		reply.Term = args.Term
+		reply.VoteGranted = true
+	} else if rf.state == Candidate && rf.timestamp < args.Timestamp {
+		rf.votedFor = args.CandidateId
+		reply.Term = args.Term
+		reply.VoteGranted = true
+	} else {
+		reply.Term = args.Term
+		reply.VoteGranted = false
+	}
+
+	if reply.VoteGranted {
+		rf.state = Follower
+		rf.eventChan <- struct{}{}
+	}
+
+	return
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -150,7 +202,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -169,7 +220,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (3B).
-
 
 	return index, term, isLeader
 }
@@ -198,13 +248,104 @@ func (rf *Raft) ticker() {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
+		switch rf.state {
+		case Follower:
+			timer := time.NewTimer(time.Duration(electionTimeout) * time.Millisecond)
+			select {
+			case <-rf.eventChan:
+				break
+			case <-timer.C:
+				rf.mu.Lock()
+				rf.state = Candidate
+				rf.currentTerm++
+				rf.votedFor = rf.me
+				rf.timestamp = time.Now().UnixNano()
+				rf.mu.Unlock()
+				break
+			}
+			break
+		case Candidate:
+			timer := time.NewTimer(time.Duration(electionTimeout) * time.Millisecond)
+			doneChan := rf.startElection()
 
+			select {
+			case <-rf.eventChan:
+				break
+			case <-doneChan:
+				break
+			case <-timer.C:
+				rf.mu.Lock()
+				rf.currentTerm++
+				rf.timestamp = time.Now().UnixNano()
+				rf.mu.Unlock()
+				break
+			}
+			break
+		case Leader:
+			_ = rf.startElection()
+			//rf.mu.Lock()
+			//<-doneChan
+			//rf.mu.Unlock()
+		}
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		ms := 50 + (rand.Int63() % 500)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
+}
+
+func (rf *Raft) startElection() <-chan struct{} {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	args := &RequestVoteArgs{
+		Term:        rf.currentTerm,
+		CandidateId: rf.me,
+		Timestamp:   rf.timestamp,
+	}
+
+	votes := 1
+	doneCh := make(chan struct{}, 1)
+
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		go func(i int) {
+			reply := &RequestVoteReply{}
+			if rf.sendRequestVote(i, args, reply) {
+				if reply.Term > rf.currentTerm {
+					rf.mu.Lock()
+					rf.currentTerm = reply.Term
+					rf.votedFor = -1
+					rf.state = Follower
+					rf.mu.Unlock()
+					doneCh <- struct{}{}
+					return
+				}
+
+				if reply.Term != rf.currentTerm || rf.state != Candidate {
+					return
+				}
+
+				if reply.VoteGranted {
+					votes++
+					if votes > len(rf.peers)/2 {
+						rf.mu.Lock()
+						rf.state = Leader
+						rf.votedFor = rf.me
+						rf.mu.Unlock()
+
+						doneCh <- struct{}{}
+						return
+					}
+				}
+			}
+		}(i)
+	}
+
+	return doneCh
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -224,13 +365,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.state = Follower
+	rf.eventChan = make(chan struct{}, 1)
+
+	rf.currentTerm = 0
+	rf.votedFor = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
